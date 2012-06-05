@@ -462,7 +462,7 @@ static int rotter_open_file(rotter_ringbuffer_t *ringbuffer)
 static int rotter_close_file(rotter_ringbuffer_t *ringbuffer)
 {
   rotter_info( "Closing file for ringbuffer %c.", ringbuffer->label);
-  encoder->close(ringbuffer->file_handle, ringbuffer->hour_start);
+  encoder->close(ringbuffer->file_handle, ringbuffer->period_start);
   ringbuffer->close_file = 0;
   ringbuffer->file_handle = NULL;
   return 0;
@@ -537,7 +537,7 @@ static int init_ringbuffers()
     }
 
     ringbuffers[b]->label = label;
-    ringbuffers[b]->hour_start = 0;
+    ringbuffers[b]->period_start = 0;
     ringbuffers[b]->file_handle = NULL;
     ringbuffers[b]->overflow = 0;
     ringbuffers[b]->close_file = 0;
