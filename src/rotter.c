@@ -3,7 +3,7 @@
   rotter.c
 
   rotter: Recording of Transmission / Audio Logger
-  Copyright (C) 2006-2010  Nicholas J. Humfrey
+  Copyright (C) 2006-2012  Nicholas J. Humfrey
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -36,6 +36,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 #include "config.h"
 #include "rotter.h"
@@ -515,6 +516,18 @@ static int rotter_process_audio()
   return total_samples;
 }
 
+static void rotter_sync_to_disk()
+{
+  int b;
+
+  for(b=0; b<2; b++) {
+    rotter_ringbuffer_t *ringbuffer = ringbuffers[b];
+    if (ringbuffer && ringbuffer->file_handle) {
+      encoder->sync(ringbuffer->file_handle);
+    }
+  }
+}
+
 static int init_ringbuffers()
 {
   size_t ringbuffer_size = 0;
@@ -531,6 +544,10 @@ static int init_ringbuffers()
       return -1;
     }
 
+    if (mlock(ringbuffers[b], sizeof(rotter_ringbuffer_t))) {
+      rotter_error("Failed to lock data structure for ringbuffer %c into physical memory.", label);
+    }
+
     ringbuffers[b]->label = label;
     ringbuffers[b]->period_start = 0;
     ringbuffers[b]->file_handle = NULL;
@@ -544,6 +561,11 @@ static int init_ringbuffers()
       if (!ringbuffers[b]->buffer[c]) {
         rotter_fatal("Cannot create ringbuffer buffer %c%d.", label, c);
         return -1;
+      }
+
+      // Lock into physical memory to avoid delays during the realtime callback
+      if (jack_ringbuffer_mlock(ringbuffers[b]->buffer[c])) {
+        rotter_error("Failed to lock JACK ringbuffer %c%d into physical memory.", label, c);
       }
     }
   }
@@ -561,6 +583,10 @@ static int deinit_ringbuffers()
         if (ringbuffers[b]->buffer[c]) {
           jack_ringbuffer_free(ringbuffers[b]->buffer[c]);
         }
+      }
+
+      if (munlock(ringbuffers[b], sizeof(rotter_ringbuffer_t))) {
+        rotter_error("Failed to unlock ringbuffer %c from physical memory.", ringbuffers[b]->label);
       }
 
       if (ringbuffers[b]->file_handle) {
@@ -627,12 +653,13 @@ static void usage()
   printf("   -f <format>   Format of recording (see list below)\n");
   printf("   -b <bitrate>  Bitrate of recording (bitstream formats only)\n");
   printf("   -c <channels> Number of channels\n");
-  printf("   -n <name>     Name for this JACK client\n");
-  printf("   -N <filename> Name for archive files (default 'archive')\n");
+  printf("   -n <name>     Name for this JACK client (default '%s')\n", DEFAULT_CLIENT_NAME);
+  printf("   -N <filename> Name for archive files (default '%s')\n", DEFAULT_ARCHIVE_NAME);
   printf("   -p <secs>     Period of each archive file (in seconds, default %d)\n", DEFAULT_ARCHIVE_PERIOD_SECONDS);
   printf("   -d <hours>    Delete files in directory older than this\n");
-  printf("   -R <secs>     Length of the ring buffer (in seconds)\n");
-  printf("   -L <layout>   File layout (default 'hierarchy')\n");
+  printf("   -R <secs>     Length of the ring buffer (in seconds, default %2.2f)\n", DEFAULT_RB_LEN);
+  printf("   -L <layout>   File layout (default '%s')\n", DEFAULT_FILE_LAYOUT);
+  printf("   -s <secs>     How often to sync to disk (in seconds, default %d)\n", DEFAULT_SYNC_PERIOD);
   printf("   -j            Don't automatically start jackd\n");
   printf("   -u            Use UTC rather than local time in filenames\n");
   printf("   -v            Enable verbose mode\n");
@@ -671,14 +698,16 @@ int main(int argc, char *argv[])
   char *connect_right = NULL;
   const char *format_name = NULL;
   int bitrate = DEFAULT_BITRATE;
+  int sync_period = DEFAULT_SYNC_PERIOD;
   float sleep_time = 0;
+  time_t next_sync = 0;
   int i,opt;
 
   // Make STDOUT unbuffered
   setbuf(stdout, NULL);
 
   // Parse Switches
-  while ((opt = getopt(argc, argv, "al:r:n:N:p:jf:b:d:c:R:L:uvqh")) != -1) {
+  while ((opt = getopt(argc, argv, "al:r:n:N:p:jf:b:d:c:R:L:s:uvqh")) != -1) {
     switch (opt) {
       case 'a':  autoconnect = 1; break;
       case 'l':  connect_left = optarg; break;
@@ -693,6 +722,7 @@ int main(int argc, char *argv[])
       case 'c':  channels = atoi(optarg); break;
       case 'R':  rb_duration = atof(optarg); break;
       case 'L':  file_layout = optarg; break;
+      case 's':  sync_period = atoi(optarg); break;
       case 'u':  utc = 1; break;
       case 'v':  verbose = 1; break;
       case 'q':  quiet = 1; break;
@@ -794,11 +824,17 @@ int main(int argc, char *argv[])
   sleep_time = (2.0f * output_format->samples_per_frame / jack_get_sample_rate( client ));
   rotter_debug("Sleep period is %dms.", (int)(sleep_time * 1000));
 
-
   while( rotter_run_state == ROTTER_STATE_RUNNING ) {
+    time_t now = time(NULL);
     int samples_processed = rotter_process_audio(encoder);
     if (samples_processed <= 0) {
       usleep(sleep_time * 1000000);
+    }
+
+    // Is it time to sync the encoded audio to disk?
+    if (next_sync < now) {
+      rotter_sync_to_disk();
+      next_sync = now + sync_period;
     }
 
     deletefiles_cleanup_child();
